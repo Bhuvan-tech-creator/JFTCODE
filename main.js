@@ -1,6 +1,6 @@
 /**
- * OBSERVER_ENGINE // COMPLETE SOURCE // VER 22.0
- * FEATURES: MP4 VIDEO TRANSITION // GLOBAL PROGRESS TRACKER // RE-ENGINEERED COIN SPAWNING
+ * OBSERVER_ENGINE // COMPLETE SOURCE // VER 22.2
+ * FEATURES: MP4 VIDEO TRANSITION // GLOBAL PROGRESS TRACKER // WIN SCREEN IMG // GLOWING COINS
  */
 
 const canvas = document.getElementById('gameCanvas');
@@ -29,7 +29,8 @@ const assetFiles = {
     intro: "intro.png", startBtn: "start_btn.png", gameOver: "gameover.png",
     drill: "drill.png", rock: "obstacle.png", enemy: "enemy.png",
     bg: "background.png", stalactite: "stalactite.png", cannonball: "cannonball.png",
-    coin: "coin.png", wormhead: "wormhead.png", wormbody: "wormbody.png", wormtail: "wormtail.png"
+    coin: "coin.png", wormhead: "wormhead.png", wormbody: "wormbody.png", wormtail: "wormtail.png",
+    win: "win.png" // Added win asset
 };
 
 const sfx = {
@@ -235,13 +236,26 @@ function drawDrilling() {
         if (Math.hypot(gear.x - o.x, (h*0.7) - o.y) < 90) { hp -= 8; obstacles.splice(i,1); }
         if (o.y > h + 100) obstacles.splice(i, 1);
     });
+    
+    // -- ENHANCED COIN RENDERING W/ GLOW --
     collectables.forEach((c, i) => {
-        c.y += 10; if (assets.coin) ctx.drawImage(assets.coin, c.x-40, c.y-40, 80, 80);
+        c.y += 10; 
+        if (assets.coin) {
+            ctx.save();
+            // Create localized glow effect
+            ctx.shadowColor = "#fff700"; // Golden white glow
+            ctx.shadowBlur = 15 + Math.sin(frame * 0.2) * 8; // Pulsing blur radius
+            ctx.drawImage(assets.coin, c.x-40, c.y-40, 80, 80);
+            ctx.restore(); // Restore to normal rendering after glow
+        }
+        
         if (Math.hypot(gear.x - c.x, (h*0.7) - c.y) < 100) { 
             coins++; score += 200; sfx.coin.cloneNode().play(); collectables.splice(i,1); 
         }
         if (c.y > h + 100) collectables.splice(i, 1);
     });
+    // ------------------------------------
+    
     if (assets.drill) ctx.drawImage(assets.drill, gear.x-60, h*0.7-100, 120, 200);
 }
 
@@ -330,23 +344,28 @@ function drawCombat(isBoss = false) {
 }
 
 function drawVideoTransition() {
-    // Draw the video frame to the canvas
     ctx.drawImage(introVid, 0, 0, w, h);
-    
-    // Check if finished
     if (introVid.ended) {
         currentState = "DRILLING";
         introVid.pause();
     }
 }
 
+// --- UPDATED WIN SCREEN W/ win.png ---
 function drawSurface() {
     if (sfx.win.paused) sfx.win.play();
-    ctx.fillStyle = "#87CEEB"; ctx.fillRect(0,0,w,h); ctx.fillStyle = "#228B22"; ctx.fillRect(0, h*0.7, w, h*0.3); 
-    ctx.fillStyle = "yellow"; ctx.beginPath(); ctx.arc(w-100, 100, 50, 0, Math.PI*2); ctx.fill();
-    ctx.fillStyle = "white"; ctx.textAlign="center"; ctx.font="bold 40px Orbitron"; ctx.fillText("MISSION COMPLETE: THE SURFACE", w/2, h/2);
-    ctx.font="24px Orbitron"; ctx.fillText(`SCORE: ${score} | COINS: ${coins}`, w/2, h/2+60);
-    ctx.fillStyle="#0ff"; ctx.fillText("CLICK TO REBOOT SYSTEM", w/2, h/2+120);
+    
+    // Draw the new victory background
+    if(assets.win) ctx.drawImage(assets.win, 0, 0, w, h);
+    else {
+        // Fallback in case win.png fails to load
+        ctx.fillStyle = "#000b21"; ctx.fillRect(0,0,w,h);
+    }
+    
+    // UI elements overlayed on the image
+    ctx.fillStyle = "white"; ctx.textAlign="center"; ctx.font="bold 40px Orbitron"; ctx.fillText("MISSION COMPLETE: THE SURFACE", w/2, h/2 - 50);
+    ctx.font="24px Orbitron"; ctx.fillText(`SCORE: ${score} | COINS: ${coins}`, w/2, h/2 + 10);
+    ctx.fillStyle="#0ff"; ctx.fillText("CLICK TO REBOOT SYSTEM", w/2, h/2 + 70);
 }
 
 // --- 5. SYSTEM LOOP ---
