@@ -1,14 +1,13 @@
 /**
- * OBSERVER_ENGINE // COMPLETE SOURCE // VER 19.0
- * FEATURES: SEQUENTIAL BOSSES // PERSISTENT INPUT LOCK // HP BARS
- * SEQUENCE: DRILL -> FIGHT -> DRILL -> FIGHT -> DRILL -> BOSS (1-BY-1) -> FINAL DRILL -> SURFACE
+ * OBSERVER_ENGINE // COMPLETE SOURCE // VER 21.0
+ * FEATURES: LEFT-SIDE PROGRESS TRACKER // RE-ENGINEERED COIN SPAWNING // AUDIO SYNC
  */
 
 const canvas = document.getElementById('gameCanvas');
 const ctx = canvas.getContext('2d');
 const video = document.getElementById('input_video');
 const pip = document.getElementById('pipCanvas'); 
-const pctx = pip.getContext('2d');
+const pctx = pip ? pip.getContext('2d') : null;
 
 let w, h;
 const resize = () => {
@@ -19,7 +18,7 @@ const resize = () => {
 window.addEventListener('resize', resize);
 resize();
 
-// --- 1. ASSETS ---
+// --- 1. ASSETS & AUDIO ---
 const assets = {};
 const assetFiles = {
     intro: "intro.png", startBtn: "start_btn.png", gameOver: "gameover.png",
@@ -27,6 +26,27 @@ const assetFiles = {
     bg: "background.png", stalactite: "stalactite.png", cannonball: "cannonball.png",
     coin: "coin.png", wormhead: "wormhead.png", wormbody: "wormbody.png", wormtail: "wormtail.png"
 };
+
+const sfx = {
+    cave: new Audio('cave.mp3'),
+    drill: new Audio('drill.wav'),
+    kill: new Audio('kill.wav'),
+    shoot: new Audio('shoot.wav'),
+    boss: new Audio('whenuseetheboss.wav'),
+    win: new Audio('win.mp3'),
+    death: new Audio('death.wav'),
+    coin: new Audio('coin.wav')
+};
+
+sfx.cave.loop = true;
+sfx.drill.loop = true;
+
+function stopAllAudio() {
+    Object.values(sfx).forEach(a => {
+        a.pause();
+        a.currentTime = 0;
+    });
+}
 
 let dirtPattern;
 function createDirtTexture() {
@@ -46,7 +66,7 @@ async function loadAssets() {
         return new Promise((res) => {
             const img = new Image();
             img.onload = () => { assets[key] = img; res(); };
-            img.onerror = () => { console.warn("Missing:", key); res(); };
+            img.onerror = () => { res(); };
             img.src = assetFiles[key];
         });
     });
@@ -54,37 +74,41 @@ async function loadAssets() {
     createDirtTexture();
 }
 
-// --- 2. STATE ---
+// --- 2. STATE & PROGRESS ---
 const STAGES = [
-    { type: "DRILLING", duration: 600 },
-    { type: "COMBAT", duration: 800 },
-    { type: "DRILLING", duration: 600 },
-    { type: "COMBAT", duration: 1000 },
-    { type: "DRILLING", duration: 600 },
-    { type: "BOSS", duration: 0 }, 
-    { type: "FINAL_DRILL", duration: 300 },
-    { type: "SURFACE", duration: 999999 }
+    { type: "DRILLING", duration: 600, label: "MINE" },
+    { type: "COMBAT", duration: 800, label: "FIGHT" },
+    { type: "DRILLING", duration: 600, label: "MINE" },
+    { type: "COMBAT", duration: 1000, label: "FIGHT" },
+    { type: "DRILLING", duration: 600, label: "MINE" },
+    { type: "BOSS", duration: 1500, label: "BOSS" }, // Boss duration is estimated for the bar
+    { type: "FINAL_DRILL", duration: 300, label: "EXIT" },
+    { type: "SURFACE", duration: 0, label: "END" }
 ];
+
+const totalGameTicks = STAGES.reduce((acc, s) => acc + s.duration, 0);
+let totalElapsedTicks = 0;
 
 let currentState = "INTRO";
 let showTutorial = false;
 let currentStageIdx = 0, stageTimer = 0;
 let frame = 0, hp = 100, score = 0, coins = 0, freezeTimer = 0;
-let gear = { x: 400, y: 400, active: true, gesture: "IDLE", charge: 0, rawLM: null };
+let gear = { x: 400, y: 400, active: false, gesture: "IDLE", charge: 0, rawLM: null };
 let obstacles = [], projectiles = [], enemies = [], collectables = [], currentWorm = [];
-let wormIndex = 0; // Tracks which of the 3 worms we are on
+let wormIndex = 0;
 let activeSingularity = null, singularityCooldown = 0;
 const BARRIER_RADIUS = 110;
 
 // --- 3. VISION ---
 const hands = new Hands({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
-hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.7 });
+hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+
 hands.onResults((res) => {
     if (pctx) { pctx.clearRect(0,0,320,180); pctx.drawImage(res.image, 0, 0, 320, 180); }
     if (res.multiHandLandmarks && res.multiHandLandmarks.length > 0) {
         const lm = res.multiHandLandmarks[0];
         gear.rawLM = lm;
-        gear.active = true; // Input is live
+        gear.active = true;
         gear.x += ((1 - lm[9].x) * w - gear.x) * 0.4;
         gear.y += (lm[9].y * h - gear.y) * 0.4;
         
@@ -107,11 +131,45 @@ hands.onResults((res) => {
 
         if (g === "SINGULARITY" && !activeSingularity && singularityCooldown <= 0) { activeSingularity = { x: gear.x, y: gear.y, timer: 300 }; singularityCooldown = 600; }
         if (g === "FREEZE" && freezeTimer <= 0) freezeTimer = 200;
-    } 
-    // If no hand, gear.active stays true, keeping x/y locked at last position.
+    } else {
+        gear.active = false;
+    }
 });
 
 // --- 4. RENDERERS ---
+function drawProgressTracker() {
+    const barX = 30, barY = 150, barW = 20, barH = h - 300;
+    
+    // Background
+    ctx.fillStyle = "rgba(0, 255, 255, 0.1)";
+    ctx.fillRect(barX, barY, barW, barH);
+    ctx.strokeStyle = "#0ff";
+    ctx.strokeRect(barX, barY, barW, barH);
+
+    // Dynamic Fill
+    let progress = Math.min(1, totalElapsedTicks / totalGameTicks);
+    ctx.fillStyle = "#0ff";
+    ctx.fillRect(barX, barY + barH, barW, -barH * progress);
+
+    // Milestones
+    let currentTicks = 0;
+    STAGES.forEach((stage, idx) => {
+        let markY = barY + barH - (barH * (currentTicks / totalGameTicks));
+        ctx.beginPath();
+        ctx.moveTo(barX, markY);
+        ctx.lineTo(barX + barW + 10, markY);
+        ctx.strokeStyle = idx <= currentStageIdx ? "#0ff" : "#555";
+        ctx.stroke();
+        
+        ctx.font = "10px Orbitron";
+        ctx.fillStyle = idx <= currentStageIdx ? "#0ff" : "#555";
+        ctx.textAlign = "left";
+        ctx.fillText(stage.label, barX + barW + 15, markY + 4);
+        
+        currentTicks += stage.duration;
+    });
+}
+
 function drawTutorial() {
     ctx.fillStyle = "rgba(0, 5, 20, 0.98)"; ctx.fillRect(0, 0, w, h);
     ctx.strokeStyle = "#0ff"; ctx.lineWidth = 3; ctx.strokeRect(w/2-350, h/2-280, 700, 560);
@@ -125,7 +183,7 @@ function drawTutorial() {
         ["COMBAT", "FIST", "CHARGE CANNONBALL"],
         ["COMBAT", "OPEN HAND", "FIRE CANNONBALL"],
         ["COMBAT", "SPIDERMAN", "FREEZE ENEMIES"],
-        ["COMBAT", "PINCH+3F", "SINGULARITY"]
+        ["GET", "YOUR", "REVENGE"]
     ];
     ctx.font = "16px Orbitron"; ctx.textAlign = "left";
     rows.forEach((r, i) => {
@@ -149,10 +207,11 @@ function drawUI() {
     ctx.fillStyle="#ffd700"; ctx.fillText(`COINS: ${coins}`, 170, 80);
     ctx.fillStyle="#222"; ctx.fillRect(w/2-150, 30, 300, 15);
     ctx.fillStyle=`hsl(${(hp/100)*120}, 100%, 50%)`; ctx.fillRect(w/2-150, 30, (Math.max(0, hp)/100)*300, 15);
+    drawProgressTracker();
 }
 
 function drawHandSkeleton() {
-    if (!gear.rawLM) return;
+    if (!gear.rawLM || !gear.active) return;
     ctx.beginPath(); ctx.arc(gear.x, gear.y, BARRIER_RADIUS, 0, Math.PI*2);
     ctx.strokeStyle = "rgba(0, 255, 255, 0.4)"; ctx.lineWidth = 3; ctx.stroke();
     ctx.save(); ctx.translate(gear.x, gear.y); ctx.scale(0.3, 0.3);
@@ -169,27 +228,46 @@ function drawHandSkeleton() {
 
 function drawDrilling() {
     stageTimer++;
+    totalElapsedTicks++;
+    if (sfx.drill.paused) sfx.drill.play();
+    
     if (stageTimer > STAGES[currentStageIdx].duration) {
         currentStageIdx++; stageTimer=0; currentState = STAGES[currentStageIdx].type;
+        sfx.drill.pause();
         if (currentState === "BOSS") { wormIndex = 0; spawnNextWorm(); }
         obstacles = []; collectables = []; return;
     }
+
     ctx.save(); ctx.translate(0, (frame * 15) % 128); ctx.fillStyle = dirtPattern; ctx.fillRect(0, -128, w, h + 256); ctx.restore();
-    if (frame % 40 === 0) obstacles.push({ x: Math.random()*w, y: -200 });
-    if (frame % 50 === 0) collectables.push({ x: Math.random()*w, y: -100 });
+    
+    if (frame % 40 === 0) obstacles.push({ x: Math.random()*(w-200)+100, y: -100 });
+    if (frame % 35 === 0) collectables.push({ x: Math.random()*(w-200)+100, y: -50 });
+    
     obstacles.forEach((o, i) => {
-        o.y += 18; if (assets.rock) ctx.drawImage(assets.rock, o.x-80, o.y-80, 160, 160);
-        if (Math.hypot(gear.x - o.x, (h*0.7) - o.y) < 85) { hp -= 8; obstacles.splice(i,1); }
+        o.y += 15; 
+        if (assets.rock) ctx.drawImage(assets.rock, o.x-80, o.y-80, 160, 160);
+        if (Math.hypot(gear.x - o.x, (h*0.7) - o.y) < 90) { hp -= 8; obstacles.splice(i,1); }
+        if (o.y > h + 100) obstacles.splice(i, 1);
     });
+
     collectables.forEach((c, i) => {
-        c.y += 12; if (assets.coin) ctx.drawImage(assets.coin, c.x-30, c.y-30, 60, 60);
-        if (Math.hypot(gear.x - c.x, (h*0.7) - c.y) < 70) { coins++; score += 200; collectables.splice(i,1); }
+        c.y += 10; 
+        if (assets.coin) ctx.drawImage(assets.coin, c.x-40, c.y-40, 80, 80);
+        // Fixed Collision for Drill Height (h*0.7)
+        let dist = Math.hypot(gear.x - c.x, (h*0.7) - c.y);
+        if (dist < 100) { 
+            coins++; score += 200; 
+            sfx.coin.cloneNode().play();
+            collectables.splice(i,1); 
+        }
+        if (c.y > h + 100) collectables.splice(i, 1);
     });
     if (assets.drill) ctx.drawImage(assets.drill, gear.x-60, h*0.7-100, 120, 200);
 }
 
 function spawnNextWorm() {
     currentWorm = [];
+    sfx.boss.play();
     for(let i=0; i<12; i++) {
         currentWorm.push({ 
             x: -200 - (i*40), y: h/2, 
@@ -201,89 +279,101 @@ function spawnNextWorm() {
 
 function drawCombat(isBoss = false) {
     if (assets.bg) ctx.drawImage(assets.bg, 0, 0, w, h);
+    if (sfx.cave.paused) sfx.cave.play();
     if (freezeTimer > 0) freezeTimer--;
     if (singularityCooldown > 0) singularityCooldown--;
     
-    // Projectiles
-    if (gear.rawLM) {
+    if (!isBoss) { stageTimer++; totalElapsedTicks++; }
+    else { totalElapsedTicks += 0.5; } // Slow creep during boss
+
+    if (gear.rawLM && gear.active) {
         const lm = gear.rawLM;
         const iTip = { x: (1-lm[8].x)*w, y: lm[8].y*h };
         const dx = iTip.x - ((1-lm[5].x)*w), dy = iTip.y - (lm[5].y*h), dist = Math.hypot(dx,dy)||1;
         const iVec = { x: dx/dist, y: dy/dist, angle: Math.atan2(dy,dx) };
-        if (gear.gesture === "SINGLE" && frame % 8 === 0) projectiles.push({x: iTip.x, y: iTip.y, vx: iVec.x*35, vy: iVec.y*35, type: "STALACTITE", angle: iVec.angle});
+        
+        if (gear.gesture === "SINGLE" && frame % 8 === 0) {
+            projectiles.push({x: iTip.x, y: iTip.y, vx: iVec.x*35, vy: iVec.y*35, type: "STALACTITE", angle: iVec.angle});
+            sfx.shoot.cloneNode().play();
+        }
         if (gear.gesture === "PEACE" && frame % 10 === 0) {
             projectiles.push({x: iTip.x, y: iTip.y, vx: iVec.x*35, vy: iVec.y*35, type: "STALACTITE", angle: iVec.angle});
             projectiles.push({x: (1-lm[12].x)*w, y: lm[12].y*h, vx: iVec.x*35, vy: iVec.y*35, type: "STALACTITE", angle: iVec.angle});
+            sfx.shoot.cloneNode().play();
         }
         if (gear.gesture === "CHARGE") gear.charge = Math.min(400, gear.charge + 15);
-        if (gear.gesture === "FIRE_CANNON") { projectiles.push({x: gear.x, y: gear.y, vx: iVec.x*22, vy: iVec.y*22, type: "CANNON", size: 65+gear.charge/4}); gear.charge = 0; }
+        if (gear.gesture === "FIRE_CANNON") { 
+            projectiles.push({x: gear.x, y: gear.y, vx: iVec.x*22, vy: iVec.y*22, type: "CANNON", size: 65+gear.charge/4}); 
+            sfx.shoot.cloneNode().play();
+            gear.charge = 0; 
+        }
     }
 
-    projectiles.forEach((p, i) => { p.x += p.vx; p.y += p.vy; ctx.save(); ctx.translate(p.x, p.y); if (p.type === "STALACTITE" && assets.stalactite) { ctx.rotate(p.angle+Math.PI/2); ctx.drawImage(assets.stalactite, -20, -40, 40, 80); } else if (assets.cannonball) ctx.drawImage(assets.cannonball, -p.size/2, -p.size/2, p.size, p.size); ctx.restore(); });
+    projectiles.forEach((p, i) => { 
+        p.x += p.vx; p.y += p.vy; 
+        ctx.save(); ctx.translate(p.x, p.y); 
+        if (p.type === "STALACTITE" && assets.stalactite) { ctx.rotate(p.angle+Math.PI/2); ctx.drawImage(assets.stalactite, -20, -40, 40, 80); } 
+        else if (assets.cannonball) ctx.drawImage(assets.cannonball, -p.size/2, -p.size/2, p.size, p.size); 
+        ctx.restore();
+        if(p.x < -200 || p.x > w+200 || p.y < -200 || p.y > h+200) projectiles.splice(i,1);
+    });
 
     if (isBoss) {
-        // Spawn minions only during the final worm
         if (wormIndex === 2 && frame % 60 === 0 && enemies.length < 4) {
             enemies.push({ x: Math.random()*w, y: -100, hp: 12, max: 12 });
         }
-
-        // Handle Current Worm
         if (currentWorm.length > 0) {
             currentWorm.forEach((s, i) => {
                 const tx = i === 0 ? gear.x : currentWorm[i-1].x; const ty = i === 0 ? gear.y : currentWorm[i-1].y;
                 const angle = Math.atan2(ty - s.y, tx - s.x);
                 if (freezeTimer <= 0) {
-                    if (i === 0) { s.x += Math.cos(angle)*2.5; s.y += Math.sin(angle)*2.5; } // SLOWER SPEED
+                    if (i === 0) { s.x += Math.cos(angle)*3; s.y += Math.sin(angle)*3; } 
                     else { const d = Math.hypot(tx-s.x, ty-s.y); if(d>35){ s.x += Math.cos(angle)*(d-35); s.y += Math.sin(angle)*(d-35); } }
                 }
                 ctx.save(); ctx.translate(s.x, s.y); if(s.type==="body") ctx.scale(1, Math.sin(frame*0.1+i)*0.3+1);
                 ctx.rotate(angle); let img = s.type==="head"?assets.wormhead:(s.type==="tail"?assets.wormtail:assets.wormbody);
                 if(img) ctx.drawImage(img, -45, -45, 90, 90); ctx.restore();
-                
-                // Segment Health Bar
                 ctx.fillStyle="black"; ctx.fillRect(s.x-25, s.y-55, 50, 6); ctx.fillStyle="red"; ctx.fillRect(s.x-25, s.y-55, (s.hp/s.maxHp)*50, 6);
 
                 projectiles.forEach((p, pi) => {
-                    if (Math.hypot(p.x-s.x, p.y-s.y) < 50) { 
+                    if (Math.hypot(p.x-s.x, p.y-s.y) < 55) { 
                         s.hp -= (p.type==="CANNON"?25:5); 
                         if(p.type!=="CANNON") projectiles.splice(pi,1); 
-                        if(s.hp<=0) currentWorm.splice(i,1); 
+                        if(s.hp<=0) { sfx.kill.cloneNode().play(); currentWorm.splice(i,1); }
                     }
                 });
                 if(Math.hypot(gear.x-s.x, gear.y-s.y)<70) hp-=0.2;
             });
         } else {
-            // Worm died, check for next
             wormIndex++;
             if (wormIndex < 3) spawnNextWorm();
-            else { currentStageIdx++; currentState = "FINAL_DRILL"; stageTimer = 0; enemies = []; }
+            else { currentStageIdx++; currentState = "FINAL_DRILL"; stageTimer = 0; enemies = []; sfx.cave.pause(); }
         }
-
-        // Process minion combat during boss
-        enemies.forEach((e, i) => {
-            let d = Math.hypot(gear.x-e.x, gear.y-e.y);
-            if(freezeTimer<=0){ e.x += (gear.x-e.x)/d*4; e.y += (gear.y-e.y)/d*4+1; }
-            if(assets.enemy) ctx.drawImage(assets.enemy, e.x-30, e.y-30, 60, 60);
-            projectiles.forEach((p, pi) => { if(Math.hypot(p.x-e.x, p.y-e.y)<50){ e.hp -= (p.type==="CANNON"?20:6); if(p.type!=="CANNON") projectiles.splice(pi,1); if(e.hp<=0) enemies.splice(i,1); } });
-            if(d < 70) hp -= 0.1;
-        });
-
     } else {
-        stageTimer++;
-        if (stageTimer > STAGES[currentStageIdx].duration) { currentStageIdx++; stageTimer=0; currentState = STAGES[currentStageIdx].type; enemies=[]; projectiles=[]; }
+        if (stageTimer > STAGES[currentStageIdx].duration) { 
+            currentStageIdx++; stageTimer=0; currentState = STAGES[currentStageIdx].type; 
+            enemies=[]; projectiles=[]; sfx.cave.pause();
+        }
         if (frame % 45 === 0 && freezeTimer <= 0) enemies.push({ x: Math.random()*w, y: -100, hp: 12, max: 12 });
         enemies.forEach((e, i) => {
             let d = Math.hypot(gear.x-e.x, gear.y-e.y);
             if(freezeTimer<=0){ e.x += (gear.x-e.x)/d*4; e.y += (gear.y-e.y)/d*4+1; }
             if(assets.enemy) ctx.drawImage(assets.enemy, e.x-30, e.y-30, 60, 60);
             ctx.fillStyle="black"; ctx.fillRect(e.x-20, e.y-40, 40, 5); ctx.fillStyle="#0f0"; ctx.fillRect(e.x-20, e.y-40, (e.hp/e.max)*40, 5);
-            projectiles.forEach((p, pi) => { if(Math.hypot(p.x-e.x, p.y-e.y)<50){ e.hp -= (p.type==="CANNON"?20:6); if(p.type!=="CANNON") projectiles.splice(pi,1); if(e.hp<=0){ enemies.splice(i,1); score+=300; } } });
+            projectiles.forEach((p, pi) => { 
+                if(Math.hypot(p.x-e.x, p.y-e.y)<50){ 
+                    e.hp -= (p.type==="CANNON"?20:6); 
+                    if(p.type!=="CANNON") projectiles.splice(pi,1); 
+                    if(e.hp<=0){ sfx.kill.cloneNode().play(); enemies.splice(i,1); score+=300; } 
+                } 
+            });
             if(d < 70) hp -= 0.2;
         });
     }
 }
 
 function drawSurface() {
+    if (sfx.win.paused) sfx.win.play();
     ctx.fillStyle = "#87CEEB"; ctx.fillRect(0,0,w,h); 
     ctx.fillStyle = "#228B22"; ctx.fillRect(0, h*0.7, w, h*0.3); 
     ctx.fillStyle = "yellow"; ctx.beginPath(); ctx.arc(w-100, 100, 50, 0, Math.PI*2); ctx.fill();
@@ -296,37 +386,64 @@ function drawSurface() {
 // --- 5. SYSTEM LOOP ---
 async function startSystem() {
     await loadAssets();
-    const camera = new Camera(video, { onFrame: async () => { await hands.send({image: video}); }, width: 640, height: 480 });
+    const camera = new Camera(video, { 
+        onFrame: async () => { await hands.send({image: video}); }, 
+        width: 640, height: 480 
+    });
     camera.start();
-    requestAnimationFrame(function loop() {
+
+    function loop() {
         if (!showTutorial) frame++; 
         ctx.clearRect(0,0,w,h);
-        if (hp <= 0 && currentState !== "GAMEOVER") currentState = "GAMEOVER";
-        if (currentState === "INTRO") {
-            if(assets.intro) ctx.drawImage(assets.intro, 0, 0, w, h);
-            if(assets.startBtn) ctx.drawImage(assets.startBtn, w/2-150, h*0.7, 300, 100);
-        } else if (showTutorial) {
-            drawTutorial();
-        } else if (currentState === "DRILLING" || currentState === "FINAL_DRILL") {
-            drawDrilling(); drawUI();
-        } else if (currentState === "COMBAT") {
-            drawCombat(false); drawUI(); drawHandSkeleton();
-        } else if (currentState === "BOSS") {
-            drawCombat(true); drawUI(); drawHandSkeleton();
-        } else if (currentState === "SURFACE") {
-            drawSurface();
-        } else if (currentState === "GAMEOVER") {
-            if(assets.gameOver) ctx.drawImage(assets.gameOver, 0, 0, w, h);
-            ctx.fillStyle="white"; ctx.font="30px Orbitron"; ctx.textAlign="center";
-            ctx.fillText(`SCORE: ${score} | COINS: ${coins}`, w/2, h/2+80);
+        
+        if (hp <= 0 && currentState !== "GAMEOVER") {
+            currentState = "GAMEOVER";
+            stopAllAudio();
+            sfx.death.play();
         }
+
+        switch(currentState) {
+            case "INTRO":
+                if(assets.intro) ctx.drawImage(assets.intro, 0, 0, w, h);
+                if(assets.startBtn) ctx.drawImage(assets.startBtn, w/2-150, h*0.7, 300, 100);
+                break;
+            case "DRILLING":
+            case "FINAL_DRILL":
+                drawDrilling(); drawUI();
+                break;
+            case "COMBAT":
+                drawCombat(false); drawUI(); drawHandSkeleton();
+                break;
+            case "BOSS":
+                drawCombat(true); drawUI(); drawHandSkeleton();
+                break;
+            case "SURFACE":
+                drawSurface();
+                break;
+            case "GAMEOVER":
+                if(assets.gameOver) ctx.drawImage(assets.gameOver, 0, 0, w, h);
+                ctx.fillStyle="white"; ctx.font="30px Orbitron"; ctx.textAlign="center";
+                ctx.fillText(`SCORE: ${score} | COINS: ${coins}`, w/2, h/2+80);
+                break;
+        }
+
+        if (showTutorial) drawTutorial();
         requestAnimationFrame(loop);
-    });
+    }
+    loop();
 }
 
 canvas.addEventListener('mousedown', () => {
-    if (currentState === "INTRO") { hp=100; score=0; coins=0; currentStageIdx=0; currentState="DRILLING"; showTutorial=true; }
+    if (currentState === "INTRO") { 
+        hp=100; score=0; coins=0; currentStageIdx=0; currentState="DRILLING"; showTutorial=true; 
+        totalElapsedTicks = 0;
+        stopAllAudio();
+    }
     else if (showTutorial) showTutorial = false;
-    else if (currentState === "GAMEOVER" || currentState === "SURFACE") { currentState="INTRO"; currentStageIdx=0; }
+    else if (currentState === "GAMEOVER" || currentState === "SURFACE") { 
+        currentState="INTRO"; currentStageIdx=0; 
+        stopAllAudio();
+    }
 });
+
 startSystem();
