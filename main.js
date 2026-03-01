@@ -1,7 +1,7 @@
 /**
- * OBSERVER_ENGINE // COMPLETE SOURCE // VER 5.0
- * FEATURES: BALANCED ROCK SPANNING // COMPACT SKELETON // MECHANICAL REBOUND
- * TUNING: SPAWN_RATE 50 // HITBOX_SENSITIVITY 0.8
+ * OBSERVER_ENGINE // COMPLETE SOURCE // VER 6.6
+ * FEATURES: ALPHA-FADE TRANSITIONS // SCREEN SHAKE // PERSISTENT DATA
+ * LOGIC: STATE INTERCEPTION // ASYNC LERP // GLOBAL ALPHA WRAPPER
  */
 
 const canvas = document.getElementById('gameCanvas');
@@ -19,256 +19,293 @@ const resize = () => {
 window.addEventListener('resize', resize);
 resize();
 
-// --- 1. ASSET PRELOADER ---
+// --- 1. ASSET & TEXTURE GENERATOR ---
 const assets = {};
 const assetFiles = {
-    intro: "intro.png",
-    startBtn: "start_btn.png",
-    gameOver: "gameover.png",
-    drill: "drill.png",
-    rock: "obstacle.png",
-    enemy: "enemy.png",
-    bg: "background.png",
-    stalactite: "stalactite.png",
-    cannonball: "cannonball.png"
+    intro: "intro.png", startBtn: "start_btn.png", gameOver: "gameover.png",
+    drill: "drill.png", rock: "obstacle.png", enemy: "enemy.png",
+    bg: "background.png", stalactite: "stalactite.png", cannonball: "cannonball.png"
 };
+
+let dirtPattern;
+function createDirtTexture() {
+    const dSize = 128;
+    const dCanvas = document.createElement('canvas');
+    dCanvas.width = dSize; dCanvas.height = dSize;
+    const dCtx = dCanvas.getContext('2d');
+    dCtx.fillStyle = "#1a0f00"; dCtx.fillRect(0,0,dSize,dSize);
+    for(let i=0; i<400; i++) {
+        const x = Math.random()*dSize; const y = Math.random()*dSize;
+        const s = Math.random()*4;
+        dCtx.fillStyle = Math.random() > 0.5 ? "#2a1a00" : "#120800";
+        dCtx.fillRect(Math.floor(x), Math.floor(y), s, s);
+    }
+    dirtPattern = ctx.createPattern(dCanvas, 'repeat');
+}
 
 async function loadAssets() {
     const promises = Object.keys(assetFiles).map(key => {
-        return new Promise((res, rej) => {
+        return new Promise((res) => {
             const img = new Image();
-            img.src = assetFiles[key];
             img.onload = () => { assets[key] = img; res(); };
-            img.onerror = () => rej(`Missing: ${assetFiles[key]}`);
+            img.src = assetFiles[key];
         });
     });
-    try { await Promise.all(promises); startEngine(); } 
-    catch (err) { alert(err); }
+    await Promise.all(promises);
+    createDirtTexture();
 }
 
-// --- 2. GLOBAL STATE & BALANCED PHYSICS ---
+// --- 2. GLOBAL STATE & TRANSITION LOGIC ---
 let currentState = "INTRO"; 
+let nextState = null;
+let transitionAlpha = 0; // 0 to 1
+let transitionDir = 1; // 1 for fading out, -1 for fading in
+let isTransitioning = false;
+
 let gameTimer = 0, frame = 0, hp = 100, score = 0, freezeTimer = 0;
 let gear = { x: 0, y: 0, active: false, gesture: "IDLE", charge: 0, rawLM: null };
 let obstacles = [], projectiles = [], enemies = [];
+let activeSingularity = null, singularityCooldown = 0;
+let gestureHistory = [];
+const FILTER_STRENGTH = 3; 
+const BARRIER_RADIUS = 100;
 
-let drillSpeed = 12; 
-let bounceY = 0;     
-const DRILL_HOME_Y = 0.7;
-const DRILL_SCALE = 0.2, ROCK_SCALE = 2.5, PHASE_DURATION = 800, LERP = 0.35;
-const HAND_UI_SCALE = 0.3; // Even smaller for better visibility
-
-// --- 3. INPUT ---
-canvas.addEventListener('mousedown', (e) => {
-    if (currentState === "INTRO") {
-        currentState = "DRILLING";
-        hp = 100; score = 0; gameTimer = 0; bounceY = 0;
-        obstacles = []; projectiles = []; enemies = [];
-    } else if (currentState === "GAMEOVER") currentState = "INTRO";
-});
-
-// --- 4. GESTURE & VISION ---
-function isFingerExtended(tip, pip, mcp, palm) {
-    return Math.hypot(tip.x - palm.x, tip.y - palm.y) > Math.hypot(pip.x - palm.x, pip.y - palm.y) * 1.15;
+function triggerTransition(toState) {
+    if (isTransitioning) return;
+    nextState = toState;
+    isTransitioning = true;
+    transitionAlpha = 0;
+    transitionDir = 1;
 }
 
-function getFiringVector(mcp, tip) {
-    const dx = (1 - tip.x) * w - (1 - mcp.x) * w;
-    const dy = tip.y * h - mcp.y * h;
-    const mag = Math.hypot(dx, dy) || 1;
-    return { x: dx / mag, y: dy / mag, angle: Math.atan2(dy, dx) };
-}
-
+// --- 3. VISION SYSTEM ---
 const hands = new Hands({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
-hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.8 });
+hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.7 });
 
 hands.onResults((res) => {
     pctx.clearRect(0, 0, 320, 180);
-    pctx.save(); pctx.scale(-1, 1); pctx.translate(-320, 0);
-    pctx.drawImage(res.image, 0, 0, 320, 180); pctx.restore();
-
+    pctx.drawImage(res.image, 0, 0, 320, 180);
     if (res.multiHandLandmarks && res.multiHandLandmarks.length > 0) {
         const lm = res.multiHandLandmarks[0];
         gear.rawLM = lm; gear.active = true;
-        gear.x += ((1 - lm[9].x) * w - gear.x) * LERP;
-        gear.y += (lm[9].y * h - gear.y) * LERP;
-        
-        const palm = lm[0];
-        const f = [isFingerExtended(lm[8], lm[6], lm[5], palm), isFingerExtended(lm[12], lm[10], lm[9], palm), 
-                   isFingerExtended(lm[16], lm[14], lm[13], palm), isFingerExtended(lm[20], lm[18], lm[17], palm)];
-        
-        if (f[0] && !f[1] && !f[2] && !f[3]) gear.gesture = "SINGLE";
-        else if (f[0] && f[1] && !f[2] && !f[3]) gear.gesture = "PEACE";
-        else if (f[0] && f[1] && f[2] && !f[3]) gear.gesture = "HEAL";
-        else if (!f[0] && !f[1] && !f[2] && !f[3]) gear.gesture = "CHARGE";
-        else if (f[0] && f[1] && f[2] && f[3]) gear.gesture = (gear.charge > 20) ? "FIRE_CANNON" : "OPEN";
-        else if (f[0] && f[3] && !f[1] && !f[2]) gear.gesture = "FREEZE";
-        else gear.gesture = "IDLE";
+        gear.x += ((1 - lm[9].x) * w - gear.x) * 0.4;
+        gear.y += (lm[9].y * h - gear.y) * 0.4;
+        const f = [
+            Math.hypot(lm[8].x - lm[0].x, lm[8].y - lm[0].y) > Math.hypot(lm[6].x - lm[0].x, lm[6].y - lm[0].y) * 1.2,
+            Math.hypot(lm[12].x - lm[0].x, lm[12].y - lm[0].y) > Math.hypot(lm[10].x - lm[0].x, lm[10].y - lm[0].y) * 1.2,
+            Math.hypot(lm[16].x - lm[0].x, lm[16].y - lm[0].y) > Math.hypot(lm[14].x - lm[0].x, lm[14].y - lm[0].y) * 1.2,
+            Math.hypot(lm[20].x - lm[0].x, lm[20].y - lm[0].y) > Math.hypot(lm[18].x - lm[0].x, lm[18].y - lm[0].y) * 1.2
+        ];
+        const pinch = Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y);
+        let rawG = "IDLE";
+        if (pinch < 0.05 && f[1] && f[2] && f[3]) rawG = "SINGULARITY";
+        else if (f[0] && f[3] && !f[1] && !f[2]) rawG = "FREEZE";
+        else if (f[0] && f[1] && f[2] && f[3]) rawG = (gear.charge > 30) ? "FIRE_CANNON" : "OPEN";
+        else if (!f[0] && !f[1] && !f[2] && !f[3]) rawG = "CHARGE";
+        else if (f[0] && f[1] && !f[2] && !f[3]) rawG = "PEACE";
+        else if (f[0] && !f[1] && !f[2] && !f[3]) rawG = "SINGLE";
+        gestureHistory.push(rawG);
+        if (gestureHistory.length > FILTER_STRENGTH) gestureHistory.shift();
+        if (gestureHistory.every(g => g === rawG)) gear.gesture = rawG;
+        if (gear.gesture === "SINGULARITY" && !activeSingularity && singularityCooldown <= 0) {
+            activeSingularity = { x: gear.x, y: gear.y, timer: 300 };
+            singularityCooldown = 600;
+        }
     } else gear.active = false;
 });
 
-new Camera(video, { onFrame: async () => { await hands.send({image: video}); }, width: 640, height: 480 }).start();
-
-// --- 5. RENDER SYSTEM ---
-
+// --- 4. PHASE RENDERING ---
 function drawHUD() {
-    const barW = 400, barH = 20, bx = w/2 - barW/2, by = 30;
-    ctx.fillStyle = "rgba(20, 20, 20, 0.7)";
-    ctx.fillRect(bx - 4, by - 4, barW + 8, barH + 8);
-    const hue = Math.max(0, (hp / 100) * 120);
-    ctx.fillStyle = `hsl(${hue}, 80%, 50%)`;
-    ctx.fillRect(bx, by, (Math.max(0, hp)/100) * barW, barH);
-    ctx.fillStyle = "white"; ctx.font = "bold 16px Orbitron, sans-serif";
-    ctx.textAlign = "center"; ctx.fillText(`HULL INTEGRITY: ${Math.ceil(hp)}%`, w/2, by + 16);
-    ctx.textAlign = "right"; ctx.fillText(`XP: ${score}`, w - 40, 45);
+    const boxX = 25, boxY = 25, boxW = 240, boxH = 100;
+    ctx.fillStyle = "rgba(0, 10, 25, 0.9)";
+    ctx.beginPath(); ctx.roundRect(boxX, boxY, boxW, boxH, 12); ctx.fill();
+    ctx.strokeStyle = "#0ff"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.textAlign = "center"; 
+    ctx.fillStyle = "#0ff"; ctx.font = "bold 12px Orbitron";
+    ctx.fillText("PILOT XP STATUS", boxX + boxW/2, boxY + 35);
+    ctx.fillStyle = "white"; ctx.font = "bold 28px Orbitron";
+    ctx.fillText(score.toString().padStart(6, '0'), boxX + boxW/2, boxY + 70);
+    const bW = 400, bH = 14, bx = w/2 - 200, by = 30;
+    ctx.fillStyle = "rgba(0,0,0,0.6)"; ctx.fillRect(bx-2, by-2, bW+4, bH+4);
+    ctx.fillStyle = `hsl(${(hp/100)*120}, 100%, 50%)`;
+    ctx.fillRect(bx, by, (Math.max(0, hp)/100)*bW, bH);
 }
 
 function drawDrilling() {
     gameTimer++;
-    if (gameTimer > PHASE_DURATION) { currentState = "COMBAT"; return; }
-    if (hp <= 0) { currentState = "GAMEOVER"; return; }
-    
-    ctx.fillStyle = "#1a0f00"; ctx.fillRect(0, 0, w, h);
-    
-    // Recovery decay
-    if (bounceY > 0) { bounceY -= 2.0; if (bounceY < 0) bounceY = 0; }
-    let currentDrillY = h * DRILL_HOME_Y + bounceY;
-
-    // REDUCED SPAWN FREQUENCY: Changed from every 15/20 frames to every 50
-    if (frame % 50 === 0) {
-        // Lane logic: snap rocks to 5 possible columns to create corridors
-        const laneWidth = w / 5;
-        const lane = Math.floor(Math.random() * 5);
-        obstacles.push({ x: lane * laneWidth + laneWidth/2, y: -200 });
-    }
-
+    if (gameTimer > 800) { triggerTransition("COMBAT"); return; }
+    if (hp <= 0) { triggerTransition("GAMEOVER"); return; }
+    ctx.save();
+    ctx.translate(0, (frame * 15) % 128);
+    ctx.fillStyle = dirtPattern;
+    ctx.fillRect(0, -128, w, h + 256);
+    ctx.restore();
+    if (frame % 45 === 0) obstacles.push({ x: Math.random() * w, y: -200 });
     obstacles.forEach((o, i) => {
-        o.y += (bounceY > 0) ? drillSpeed * 0.4 : drillSpeed;
-        ctx.save(); ctx.translate(o.x, o.y); ctx.scale(ROCK_SCALE, ROCK_SCALE);
+        o.y += 18;
+        ctx.save(); ctx.translate(o.x, o.y); ctx.scale(2.5, 2.5);
         ctx.drawImage(assets.rock, -assets.rock.width/2, -assets.rock.height/2); ctx.restore();
-        
-        if (gear.active) {
-            let d = Math.hypot(gear.x - o.x, currentDrillY - o.y);
-            // Tighter collision radius (40 instead of 45/50)
-            if (d < 40 * ROCK_SCALE) {
-                hp -= 2.5;
-                bounceY = 160; 
-                o.y -= 70;
-            }
-        }
-        if (o.y > h + 200) obstacles.splice(i, 1);
+        if (gear.active && Math.hypot(gear.x - o.x, (h*0.7) - o.y) < 85) { hp -= 8; o.y -= 200; }
+        if (o.y > h + 200) { obstacles.splice(i, 1); score += 100; }
     });
-
     if (gear.active) {
-        ctx.save(); ctx.translate(gear.x, currentDrillY); 
-        if (bounceY > 0) ctx.translate((Math.random()-0.5)*8, 0);
-        ctx.scale(DRILL_SCALE, DRILL_SCALE);
+        ctx.save(); ctx.translate(gear.x, h*0.7); ctx.scale(0.2, 0.2);
         ctx.drawImage(assets.drill, -assets.drill.width/2, -assets.drill.height/2); ctx.restore();
     }
-    drawHUD();
 }
 
 function drawCombat() {
-    if (hp <= 0) { currentState = "GAMEOVER"; return; }
+    if (hp <= 0) { triggerTransition("GAMEOVER"); return; }
     ctx.drawImage(assets.bg, 0, 0, w, h);
     if (freezeTimer > 0) freezeTimer--;
-    
-    // Combat Logic (unchanged to preserve features)
+    if (singularityCooldown > 0) singularityCooldown--;
+    let takingDamage = false;
+
+    if (activeSingularity) {
+        activeSingularity.timer--;
+        ctx.beginPath(); ctx.arc(activeSingularity.x, activeSingularity.y, 55, 0, Math.PI*2);
+        ctx.strokeStyle = "magenta"; ctx.lineWidth = 3; ctx.stroke();
+        if (activeSingularity.timer <= 0) activeSingularity = null;
+    }
+
     if (gear.active && gear.rawLM) {
         const lm = gear.rawLM;
-        const iData = getFiringVector(lm[5], lm[8]);
-        const iTip = { x: (1 - lm[8].x) * w, y: lm[8].y * h };
-        if (gear.gesture === "SINGLE" && frame % 10 === 0) {
-            projectiles.push({x: iTip.x, y: iTip.y, vx: iData.x * 30, vy: iData.y * 30, angle: iData.angle, type: "STALACTITE", p: 1.2});
-        } else if (gear.gesture === "PEACE" && frame % 10 === 0) {
-            const mData = getFiringVector(lm[9], lm[12]);
-            const mTip = { x: (1 - lm[12].x) * w, y: lm[12].y * h };
-            projectiles.push({x: iTip.x, y: iTip.y, vx: iData.x * 30, vy: iData.y * 30, angle: iData.angle, type: "STALACTITE", p: 1.2});
-            projectiles.push({x: mTip.x, y: mTip.y, vx: mData.x * 30, vy: mData.y * 30, angle: mData.angle, type: "STALACTITE", p: 1.2});
-        } else if (gear.gesture === "CHARGE") {
-            gear.charge = Math.min(350, gear.charge + 5.5);
-            ctx.shadowBlur = 35; ctx.shadowColor = "white";
-            ctx.beginPath(); ctx.arc(gear.x, gear.y, gear.charge/3, 0, Math.PI*2);
-            ctx.fillStyle = `rgba(255, 255, 255, ${gear.charge/450})`; ctx.fill(); ctx.shadowBlur = 0;
-        } else if (gear.gesture === "FIRE_CANNON") {
-            projectiles.push({x: gear.x, y: gear.y, vx: iData.x * 15, vy: iData.y * 15, type: "CANNON", p: gear.charge / 7, size: gear.charge / 1.1});
+        const iTip = { x: (1-lm[8].x)*w, y: lm[8].y*h };
+        const iKnuckle = { x: (1-lm[5].x)*w, y: lm[5].y*h };
+        const dx = iTip.x - iKnuckle.x, dy = iTip.y - iKnuckle.y, dist = Math.hypot(dx, dy)||1;
+        const iVec = { x: dx/dist, y: dy/dist, angle: Math.atan2(dy, dx) };
+        if (gear.gesture === "SINGLE" && frame % 8 === 0) {
+            projectiles.push({x: iTip.x, y: iTip.y, vx: iVec.x*35, vy: iVec.y*35, type: "STALACTITE", angle: iVec.angle});
+        } 
+        else if (gear.gesture === "PEACE" && frame % 10 === 0) {
+            const mTip = { x: (1-lm[12].x)*w, y: lm[12].y*h };
+            projectiles.push({x: iTip.x, y: iTip.y, vx: iVec.x*35, vy: iVec.y*35, type: "STALACTITE", angle: iVec.angle});
+            projectiles.push({x: mTip.x, y: mTip.y, vx: iVec.x*35, vy: iVec.y*35, type: "STALACTITE", angle: iVec.angle});
+        } 
+        else if (gear.gesture === "CHARGE") {
+            gear.charge = Math.min(400, gear.charge + 15);
+            ctx.fillStyle = "rgba(0, 255, 255, 0.3)";
+            ctx.beginPath(); ctx.arc((1-lm[9].x)*w, lm[9].y*h, gear.charge/5, 0, Math.PI*2); ctx.fill();
+        } 
+        else if (gear.gesture === "FIRE_CANNON") {
+            projectiles.push({x: (1-lm[9].x)*w, y: lm[9].y*h, vx: iVec.x*22, vy: iVec.y*22, type: "CANNON", size: 65 + gear.charge/4});
             gear.charge = 0;
-        } else if (gear.gesture === "HEAL" && frame % 30 === 0) hp = Math.min(100, hp + 1.5);
-        else if (gear.gesture === "FREEZE" && frame % 60 === 0) freezeTimer = 180;
+        }
     }
 
     projectiles.forEach((p, i) => {
         p.x += p.vx; p.y += p.vy;
         ctx.save(); ctx.translate(p.x, p.y);
         if (p.type === "STALACTITE") {
-            ctx.rotate(p.angle + Math.PI/2); ctx.shadowBlur = 20; ctx.shadowColor = "#0ff";
-            ctx.drawImage(assets.stalactite, -15, -30, 30, 60);
+            ctx.rotate(p.angle + Math.PI/2);
+            ctx.drawImage(assets.stalactite, -20, -40, 40, 80);
         } else {
-            ctx.shadowBlur = 45; ctx.shadowColor = "gold";
             ctx.drawImage(assets.cannonball, -p.size/2, -p.size/2, p.size, p.size);
         }
-        ctx.restore(); ctx.shadowBlur = 0;
-        if (p.y < -500 || p.y > h+500 || p.x < -500 || p.x > w+500) projectiles.splice(i, 1);
+        ctx.restore();
+        if (p.y < -300 || p.y > h+300 || p.x < -300 || p.x > w+300) projectiles.splice(i, 1);
     });
 
-    if (frame % 45 === 0) enemies.push({ x: Math.random() * w, y: -100, s: 0.5, hp: 4 });
+    if (frame % 40 === 0 && freezeTimer <= 0) enemies.push({ x: Math.random()*w, y: -100, z: 0.1, hp: 4 });
     enemies.forEach((e, i) => {
-        if (freezeTimer === 0) {
-            let dx = gear.x - e.x, dy = gear.y - e.y, dist = Math.hypot(dx, dy) || 1;
-            e.x += (dx / dist) * 2.5; e.y += (dy / dist) * 3.5 + 1;
-            e.s = Math.min(2.8, e.s + 0.008);
+        if (freezeTimer <= 0) {
+            e.z = Math.min(3.5, e.z + 0.018);
+            let d = Math.hypot(gear.x - e.x, gear.y - e.y);
+            if (gear.active && d < BARRIER_RADIUS) {
+                let angle = Math.atan2(gear.y - e.y, gear.x - e.x);
+                e.x = gear.x - Math.cos(angle) * BARRIER_RADIUS;
+                e.y = gear.y - Math.sin(angle) * BARRIER_RADIUS;
+                hp -= 0.15; takingDamage = true;
+            }
+            if (activeSingularity) {
+                let sd = Math.hypot(activeSingularity.x - e.x, activeSingularity.y - e.y);
+                if (sd > 110) { e.x += (activeSingularity.x - e.x) * 0.12; e.y += (activeSingularity.y - e.y) * 0.12; }
+            } else {
+                e.x += ((gear.x - e.x)/(d||1)) * 4; e.y += ((gear.y - e.y)/(d||1)) * 4 + 2;
+            }
         }
-        ctx.save(); ctx.translate(e.x, e.y); ctx.scale(e.s, e.s);
+        ctx.save(); ctx.translate(e.x, e.y); ctx.scale(e.z, e.z);
         ctx.drawImage(assets.enemy, -30, -30, 60, 60); ctx.restore();
         projectiles.forEach((p, pi) => {
-            if (Math.hypot(p.x - e.x, p.y - e.y) < 50 * e.s) {
-                e.hp -= p.p;
+            if (Math.hypot(p.x - e.x, p.y - e.y) < 55 * e.z) {
+                e.hp -= (p.type === "CANNON") ? 18 : 2;
                 if (p.type !== "CANNON") projectiles.splice(pi, 1);
-                if (e.hp <= 0) { enemies.splice(i, 1); score += 150; }
+                if (e.hp <= 0) { enemies.splice(i, 1); score += 300; }
             }
         });
-        if (Math.hypot(e.x - gear.x, e.y - gear.y) < 60) { hp -= 4; enemies.splice(i, 1); }
     });
-    drawSkeletonHand();
-    drawHUD();
-}
 
-function drawSkeletonHand() {
-    if (!gear.active || !gear.rawLM) return;
-    const lm = gear.rawLM;
-    const center = lm[9]; 
-    ctx.save();
-    ctx.translate(gear.x, gear.y);
-    ctx.scale(HAND_UI_SCALE, HAND_UI_SCALE);
-    ctx.strokeStyle = (freezeTimer > 0) ? "#0ff" : "white"; 
-    ctx.lineWidth = 15; ctx.shadowBlur = 15; ctx.shadowColor = ctx.strokeStyle;
-    const connections = [[0,1,2,3,4],[0,5,6,7,8],[0,9,10,11,12],[0,13,14,15,16],[0,17,18,19,20],[5,9,13,17,0]];
-    connections.forEach(chain => {
-        ctx.beginPath();
-        chain.forEach((idx, i) => {
-            const p = lm[idx];
-            const rx = (center.x - p.x) * w;
-            const ry = (p.y - center.y) * h;
-            if (i === 0) ctx.moveTo(rx, ry); else ctx.lineTo(rx, ry);
+    if (gear.active) {
+        ctx.beginPath(); ctx.arc(gear.x, gear.y, BARRIER_RADIUS, 0, Math.PI*2);
+        ctx.strokeStyle = takingDamage ? `rgba(0, 255, 255, ${0.5 + Math.sin(frame/2)*0.3})` : "rgba(0, 255, 255, 0.1)";
+        ctx.lineWidth = takingDamage ? 4 : 1; ctx.stroke();
+        const lm = gear.rawLM;
+        ctx.save(); ctx.translate(gear.x, gear.y); ctx.scale(0.3, 0.3);
+        ctx.strokeStyle = (singularityCooldown > 300) ? "magenta" : (freezeTimer > 0 ? "#0ff" : "white"); 
+        ctx.lineWidth = 14;
+        [[0,1,2,3,4],[0,5,6,7,8],[0,9,10,11,12],[0,13,14,15,16],[0,17,18,19,20],[5,9,13,17,0]].forEach(c => {
+            ctx.beginPath();
+            c.forEach((idx, ii) => {
+                const rx = (lm[9].x - lm[idx].x) * w, ry = (lm[idx].y - lm[9].y) * h;
+                if (ii === 0) ctx.moveTo(rx, ry); else ctx.lineTo(rx, ry);
+            });
+            ctx.stroke();
         });
-        ctx.stroke();
-    });
-    ctx.restore();
-    ctx.shadowBlur = 0;
+        ctx.restore();
+    }
 }
 
-function startEngine() {
-    function loop() {
+// --- 5. MAIN LOOP ---
+async function startSystem() {
+    await loadAssets();
+    const camera = new Camera(video, { onFrame: async () => { await hands.send({image: video}); }, width: 640, height: 480 });
+    camera.start();
+    
+    requestAnimationFrame(function loop() {
         frame++;
+        
+        // Handle Transitions
+        if (isTransitioning) {
+            transitionAlpha += 0.04 * transitionDir;
+            if (transitionAlpha >= 1) {
+                currentState = nextState;
+                transitionDir = -1;
+                // Reset state specific variables
+                if (currentState === "DRILLING") { hp = 100; score = 0; obstacles = []; enemies = []; projectiles = []; gameTimer = 0; }
+            }
+            if (transitionAlpha <= 0 && transitionDir === -1) {
+                isTransitioning = false;
+            }
+        }
+
+        ctx.clearRect(0,0,w,h);
+        
+        // Draw Current State
         if (currentState === "INTRO") {
             ctx.drawImage(assets.intro, 0, 0, w, h);
             ctx.drawImage(assets.startBtn, w/2 - 150, h * 0.72, 300, 120);
         } else if (currentState === "DRILLING") drawDrilling();
         else if (currentState === "COMBAT") drawCombat();
-        else if (currentState === "GAMEOVER") ctx.drawImage(assets.gameOver, 0, 0, w, h);
+        else if (currentState === "GAMEOVER") {
+            ctx.drawImage(assets.gameOver, 0, 0, w, h);
+            ctx.fillStyle = "white"; ctx.font = "bold 34px Orbitron"; ctx.textAlign = "center";
+            ctx.fillText(`PILOT SCORE: ${score}`, w/2, h/2 + 60);
+        }
+
+        if (currentState !== "INTRO") { ctx.textAlign = "center"; drawHUD(); }
+
+        // Draw Fade Overlay
+        if (isTransitioning || transitionAlpha > 0) {
+            ctx.fillStyle = `rgba(0, 0, 0, ${transitionAlpha})`;
+            ctx.fillRect(0, 0, w, h);
+        }
+
         requestAnimationFrame(loop);
-    }
-    loop();
+    });
 }
 
-loadAssets();
+canvas.addEventListener('mousedown', () => {
+    if (currentState === "INTRO") triggerTransition("DRILLING");
+    else if (currentState === "GAMEOVER") triggerTransition("INTRO");
+});
+startSystem();
